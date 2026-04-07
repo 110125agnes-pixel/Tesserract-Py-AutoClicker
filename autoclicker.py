@@ -38,7 +38,7 @@ def parse_args():
                    help="Treat target as a regular expression.")
     p.add_argument("--region", "-r", nargs=4, type=int, metavar=("X", "Y", "W", "H"),
                    help="Capture region: left top width height. Defaults to primary monitor.")
-    p.add_argument("--interval", "-i", type=float, default=0.7,
+    p.add_argument("--interval", "-i", type=float, default=7.0,
                    help="Minimum seconds between clicks.")
     p.add_argument("--hotkey", default="\\",
                    help="Hotkey to toggle scanning (default: \\).")
@@ -68,13 +68,33 @@ def parse_args():
                    help="Edge-based match threshold (0-1, lower is looser).")
     p.add_argument("--auto-verify", action="store_true",
                    help="Automatically send /verify <code> when a verification code is detected in the capture region.")
+    p.add_argument("--feature-match", action="store_true",
+                   help="Enable feature-based template matching (ORB/SIFT/AKAZE).")
+    p.add_argument("--feature-method", choices=["orb", "sift", "akaze"], default="orb",
+                   help="Feature detector to use for feature matching (default: orb).")
+    p.add_argument("--max-features", type=int, default=500,
+                   help="Maximum number of features to detect on the template (default: 500).")
+    p.add_argument("--match-ratio", type=float, default=0.75,
+                   help="Lowe's ratio threshold for feature matching (default: 0.75).")
+    p.add_argument("--min-feature-matches", type=int, default=8,
+                   help="Minimum good feature matches required to accept a feature match (default: 8).")
+    p.add_argument("--feature-scene-scale", type=float, default=1.0,
+                   help="Scale factor to resize the scene for feature detection (0.5=half size).")
+    p.add_argument("--repeat", action="store_true",
+                   help="After a successful click, keep repeating clicks at that location automatically.")
+    p.add_argument("--repeat-limit", type=int, default=0,
+                   help="Number of repeated clicks after detection (0 = unlimited).")
+    p.add_argument("--cycle-count", type=int, default=0,
+                   help="If >0, after this many primary (--target) clicks, click --secondary-target once and reset (e.g. 5).")
+    p.add_argument("--secondary-target", default=None,
+                   help="Secondary target text to click after cycle-count primary clicks (e.g. 'Sell').")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                    help="Logging level (default: INFO).")
     p.add_argument("--log-file", default=None,
                    help="Optional path to a logfile. If omitted logs go to stdout.")
     p.add_argument("--verify-pattern", default=r'Code:\s*([A-Za-z0-9]{3,12})',
-                   help="Regex (with a capture group) to extract the code from OCR text. Default: 'Code:\s*([A-Za-z0-9]{3,12})'.")
+                   help="Regex (with a capture group) to extract the code from OCR text. Default: 'Code:\\s*([A-Za-z0-9]{3,12})'.")
     p.add_argument("--chat-click", nargs=2, type=int, metavar=("X", "Y"),
                    help="Optional coordinates to click to focus the Discord chat input before sending the verify command.")
     p.add_argument("--verify-cooldown", type=float, default=10.0,
@@ -185,6 +205,122 @@ def template_match(gray_cv, template_img, template_scales=None, template_thresho
     return None
 
 
+def compute_features(img_gray, method: str = 'orb', max_features: int = 500):
+    """Compute keypoints and descriptors for a grayscale image using the chosen method."""
+    method = (method or 'orb').lower()
+    try:
+        if method == 'orb':
+            detector = cv2.ORB_create(nfeatures=max_features)
+        elif method == 'sift':
+            detector = cv2.SIFT_create(nfeatures=max_features)
+        elif method == 'akaze':
+            detector = cv2.AKAZE_create()
+        else:
+            detector = cv2.ORB_create(nfeatures=max_features)
+        kp, desc = detector.detectAndCompute(img_gray, None)
+        return kp, desc
+    except Exception:
+        return [], None
+
+
+def feature_match(template_kp, template_desc, template_shape, gray_cv, method='orb', ratio=0.75, min_matches=8, scene_scale=1.0, debug=False, log_callback: Optional[Callable[[str], None]] = None, logger: Optional[logging.Logger] = None):
+    """Attempt feature-based matching between the template (precomputed) and the current frame.
+
+    Returns a dict like {'type':'feature','score':..., 'loc':(x,y), 'size':(w,h)} on success or None on failure.
+    """
+    if template_desc is None or len(template_kp) == 0:
+        return None
+
+    # Optionally downscale scene for faster feature detection
+    scene = gray_cv
+    if scene_scale != 1.0 and scene_scale > 0:
+        try:
+            sw = max(1, int(gray_cv.shape[1] * scene_scale))
+            sh = max(1, int(gray_cv.shape[0] * scene_scale))
+            scene = cv2.resize(gray_cv, (sw, sh), interpolation=cv2.INTER_AREA)
+        except Exception:
+            scene = gray_cv
+
+    # detect features on scene
+    try:
+        method_l = (method or 'orb').lower()
+        if method_l == 'orb':
+            detector = cv2.ORB_create()
+        elif method_l == 'sift':
+            detector = cv2.SIFT_create()
+        elif method_l == 'akaze':
+            detector = cv2.AKAZE_create()
+        else:
+            detector = cv2.ORB_create()
+        scene_kp, scene_desc = detector.detectAndCompute(scene, None)
+    except Exception:
+        return None
+
+    if scene_desc is None or len(scene_kp) == 0:
+        return None
+
+    # choose matcher
+    try:
+        if method_l in ('orb', 'akaze'):
+            matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        else:
+            matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+        matches = matcher.knnMatch(template_desc, scene_desc, k=2)
+    except Exception:
+        return None
+
+    # Lowe's ratio test
+    good = []
+    for m in matches:
+        if len(m) == 2:
+            if m[0].distance < ratio * m[1].distance:
+                good.append(m[0])
+
+    if len(good) < min_matches:
+        return None
+
+    # compute homography
+    src_pts = np.float32([template_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    dst_pts = np.float32([scene_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+    # if scene was scaled, scale dst points back to original coordinates
+    if scene_scale != 1.0 and scene_scale > 0:
+        scale_back = 1.0 / scene_scale
+        dst_pts = dst_pts * scale_back
+
+    try:
+        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+    except Exception:
+        return None
+
+    if H is None:
+        return None
+
+    h_t, w_t = template_shape[:2]
+    pts = np.float32([[0, 0], [w_t, 0], [w_t, h_t], [0, h_t]]).reshape(-1, 1, 2)
+    try:
+        dst = cv2.perspectiveTransform(pts, H)
+    except Exception:
+        return None
+
+    xs = dst[:, 0, 0]
+    ys = dst[:, 0, 1]
+    left = int(max(0, np.min(xs)))
+    top = int(max(0, np.min(ys)))
+    right = int(min(gray_cv.shape[1] - 1, np.max(xs)))
+    bottom = int(min(gray_cv.shape[0] - 1, np.max(ys)))
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+
+    inliers = int(mask.sum()) if mask is not None else 0
+    score = float(inliers) / float(len(good)) if len(good) > 0 else 0.0
+
+    if debug:
+        _log(f"FEATURE match: good={len(good)} inliers={inliers} score={score:.3f} bbox=({left},{top},{width},{height})", log_callback, logger, level='debug')
+
+    return {'type': 'feature', 'score': score, 'loc': (left, top), 'size': (width, height)}
+
+
 def ocr_to_words(gray_for_ocr):
     data = pytesseract.image_to_data(gray_for_ocr, output_type=pytesseract.Output.DICT, config='--psm 6')
     n = len(data.get("text", []))
@@ -293,6 +429,16 @@ def run_scanner(target,
                 verify_pattern: Optional[str] = None,
                 chat_click: Optional[list] = None,
                 verify_cooldown: float = 10.0,
+                feature_match_enabled: bool = False,
+                feature_method: str = 'orb',
+                template_features = None,
+                match_ratio: float = 0.75,
+                min_feature_matches: int = 8,
+                feature_scene_scale: float = 1.0,
+                repeat_click: bool = False,
+                repeat_limit: int = 0,
+                cycle_count: int = 0,
+                secondary_target: Optional[str] = None,
                 log_callback: Optional[Callable[[str], None]] = None):
     """Run the OCR capture->match->click loop until `stop_event` is set.
 
@@ -313,8 +459,17 @@ def run_scanner(target,
 
     pattern = re.compile(target, flags=re.IGNORECASE) if regex else None
     target_lower = target.lower() if not regex else None
+    secondary_pattern = re.compile(secondary_target, flags=re.IGNORECASE) if (secondary_target and regex) else None
+    secondary_lower = secondary_target.lower() if (secondary_target and not regex) else None
+
+    # cycle state
+    primary_clicks = 0
+    active_secondary = False
 
     last_click = 0.0
+    # sticky target for repeated clicks
+    sticky_target = None
+    sticky_repeats = 0
     logger = logging.getLogger('autoclicker')
     try:
         while not (stop_event and stop_event.is_set()):
@@ -322,23 +477,76 @@ def run_scanner(target,
                 # capture + preprocess
                 img, frame_bgr, gray_cv, gray_for_ocr = capture_and_preprocess(sct, region, binarize, threshold)
 
-                # template matching (fast path)
+                # Determine which target is active this iteration (primary or secondary)
+                active_text = secondary_target if (active_secondary and secondary_target) else target
+                active_pattern = secondary_pattern if (active_secondary and secondary_pattern) else pattern
+                active_target_lower = secondary_lower if (active_secondary and secondary_lower is not None) else target_lower
+
+                # If we have a sticky target from a prior detection and repeat is enabled,
+                # only re-click it when it corresponds to the currently active target.
+                if repeat_click and sticky_target is not None and (time.time() - last_click) >= interval:
+                    label = sticky_target.get('label', 'primary')
+                    # skip repeating if labels don't match current active target
+                    if (active_secondary and label != 'secondary') or (not active_secondary and label != 'primary'):
+                        time.sleep(pause)
+                        continue
+                    cx = sticky_target.get('cx')
+                    cy = sticky_target.get('cy')
+                    # honor repeat_limit: 0 means unlimited
+                    if repeat_limit > 0 and sticky_repeats >= repeat_limit:
+                        sticky_target = None
+                        sticky_repeats = 0
+                    else:
+                        try:
+                            if not dry_run:
+                                pyautogui.click(cx, cy)
+                            last_click = time.time()
+                            sticky_repeats += 1
+                            _log(f"[{time.strftime('%H:%M:%S')}] Repeated-click at ({cx},{cy}) repeat #{sticky_repeats}", log_callback, logger)
+                        except Exception as e:
+                            _log(f"Repeat click failed: {e}", log_callback, logger, level='error')
+                    time.sleep(pause)
+                    continue
+
+                # template matching (fast path) with optional feature matching
                 matched_any = False
                 if template_img is not None:
-                    match = template_match(gray_cv, template_img, template_scales, template_threshold, edge_threshold, debug, log_callback, logger)
+                    match = None
+                    # try feature-based matching first when enabled and template features available
+                    if feature_match_enabled and template_features is not None:
+                        try:
+                            t_kp, t_desc, t_shape = template_features
+                            match = feature_match(t_kp, t_desc, t_shape, gray_cv, method=feature_method, ratio=match_ratio, min_matches=min_feature_matches, scene_scale=feature_scene_scale, debug=debug, log_callback=log_callback, logger=logger)
+                        except Exception:
+                            match = None
+
+                    # fallback to classic template/edge matching
+                    if match is None:
+                        match = template_match(gray_cv, template_img, template_scales, template_threshold, edge_threshold, debug, log_callback, logger)
+
                     if match:
                         width, height = match['size']
                         top_left = match['loc']
                         cx = region["left"] + top_left[0] + width // 2
                         cy = region["top"] + top_left[1] + height // 2
                         if (time.time() - last_click) >= interval:
-                            try:
-                                if not dry_run:
-                                    pyautogui.click(cx, cy)
-                                last_click = time.time()
-                                _log(f"[{time.strftime('%H:%M:%S')}] Template-clicked at ({cx},{cy}) score={match['score']:.3f} type={match['type']}", log_callback, logger)
-                            except Exception as e:
-                                _log(f"Click failed: {e}", log_callback, logger, level='error')
+                                try:
+                                    if not dry_run:
+                                        pyautogui.click(cx, cy)
+                                    last_click = time.time()
+                                    _log(f"[{time.strftime('%H:%M:%S')}] Template-clicked at ({cx},{cy}) score={match['score']:.3f} type={match['type']}", log_callback, logger)
+                                    # set sticky target for optional repeated clicks
+                                    if repeat_click:
+                                        sticky_target = {'cx': cx, 'cy': cy, 'label': 'primary'}
+                                        sticky_repeats = 0
+                                    # update cycle count: template clicks are treated as primary clicks
+                                    if not active_secondary:
+                                        primary_clicks += 1
+                                        if cycle_count > 0 and primary_clicks >= cycle_count and secondary_target:
+                                            active_secondary = True
+                                            _log(f"Cycle threshold reached: will click secondary target '{secondary_target}' next", log_callback, logger, level='info')
+                                except Exception as e:
+                                    _log(f"Click failed: {e}", log_callback, logger, level='error')
                         matched_any = True
 
                 if matched_any:
@@ -359,8 +567,8 @@ def run_scanner(target,
 
                 matched_any = False
 
-                # multi-word phrase matching
-                if (not regex) and (" " in target):
+                # multi-word phrase matching (use active target)
+                if (not regex) and (" " in active_text):
                     lines = {}
                     for w in words:
                         ln = w.get("line_num", 0)
@@ -376,7 +584,7 @@ def run_scanner(target,
                                 seq_conf = min([x["conf"] for x in seq]) if seq else -1.0
                                 if seq_conf < confidence:
                                     continue
-                                if joined.lower() == target_lower:
+                                if joined.lower() == active_target_lower:
                                     left_min = min(x["left"] for x in seq)
                                     top_min = min(x["top"] for x in seq)
                                     right_max = max(x["left"] + x["width"] for x in seq)
@@ -389,6 +597,20 @@ def run_scanner(target,
                                                 pyautogui.click(cx, cy)
                                             last_click = time.time()
                                             _log(f"[{time.strftime('%H:%M:%S')}] Clicked on '{joined}' at ({cx},{cy}) conf={seq_conf}", log_callback, logger)
+                                            # set sticky target
+                                            if repeat_click:
+                                                sticky_target = {'cx': cx, 'cy': cy, 'label': ('secondary' if active_secondary else 'primary')}
+                                                sticky_repeats = 0
+                                            # handle cycle state
+                                            if active_secondary:
+                                                # clicked secondary target -> reset cycle
+                                                active_secondary = False
+                                                primary_clicks = 0
+                                            else:
+                                                primary_clicks += 1
+                                                if cycle_count > 0 and primary_clicks >= cycle_count and secondary_target:
+                                                    active_secondary = True
+                                                    _log(f"Cycle threshold reached: will click secondary target '{secondary_target}' next", log_callback, logger, level='info')
                                         except Exception as e:
                                             _log(f"Click failed: {e}", log_callback, logger, level='error')
                                     matched_any = True
@@ -398,7 +620,7 @@ def run_scanner(target,
                         if matched_any:
                             break
 
-                # single-word/regex fallback
+                # single-word/regex fallback (use active target)
                 if not matched_any:
                     for w in words:
                         if w["conf"] < confidence:
@@ -406,10 +628,10 @@ def run_scanner(target,
                         text = w["text"]
                         matched = False
                         if regex:
-                            if pattern.search(text):
+                            if active_pattern and active_pattern.search(text):
                                 matched = True
                         else:
-                            if text.lower() == target_lower:
+                            if text.lower() == active_target_lower:
                                 matched = True
                         if matched and (time.time() - last_click) >= interval:
                             cx = region["left"] + w["left"] + w["width"] // 2
@@ -419,6 +641,18 @@ def run_scanner(target,
                                     pyautogui.click(cx, cy)
                                 last_click = time.time()
                                 _log(f"[{time.strftime('%H:%M:%S')}] Clicked on '{text}' at ({cx},{cy}) conf={w['conf']}", log_callback, logger)
+                                if repeat_click:
+                                    sticky_target = {'cx': cx, 'cy': cy, 'label': ('secondary' if active_secondary else 'primary')}
+                                    sticky_repeats = 0
+                                # cycle handling
+                                if active_secondary:
+                                    active_secondary = False
+                                    primary_clicks = 0
+                                else:
+                                    primary_clicks += 1
+                                    if cycle_count > 0 and primary_clicks >= cycle_count and secondary_target:
+                                        active_secondary = True
+                                        _log(f"Cycle threshold reached: will click secondary target '{secondary_target}' next", log_callback, logger, level='info')
                             except Exception as e:
                                 _log(f"Click failed: {e}", log_callback, logger, level='error')
                             break
@@ -454,6 +688,10 @@ def main():
     # configure logging
     configure_logging(getattr(args, 'log_level', 'INFO'), getattr(args, 'log_file', None))
     logger = logging.getLogger('autoclicker')
+    # when --debug is used, also enable DEBUG level logging to see template/OCR diagnostics
+    if getattr(args, 'debug', False):
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
     _log("OCR autoclicker starting.", logger=logger)
     _log(f"Press '{args.hotkey}' to toggle scanning. Press ESC to exit.", logger=logger)
 
@@ -495,6 +733,20 @@ def main():
         except Exception as e:
             _log(f"Failed to load template: {e}", logger=logger, level='error')
 
+    # Precompute template features if feature matching enabled
+    template_features = None
+    if template_img is not None and getattr(args, 'feature_match', False):
+        try:
+            kp, desc = compute_features(template_img, method=args.feature_method, max_features=args.max_features)
+            if desc is None or len(kp) == 0:
+                _log("Template feature extraction found no keypoints; disabling feature matching", logger=logger, level='warning')
+                template_features = None
+            else:
+                template_features = (kp, desc, template_img.shape)
+                _log(f"Template features computed: {len(kp)} keypoints", logger=logger)
+        except Exception as e:
+            _log(f"Failed to compute template features: {e}", logger=logger, level='warning')
+
     try:
         run_scanner(args.target,
             region,
@@ -517,6 +769,16 @@ def main():
             args.verify_pattern,
             args.chat_click,
             args.verify_cooldown,
+            feature_match_enabled=getattr(args, 'feature_match', False),
+            feature_method=getattr(args, 'feature_method', 'orb'),
+            template_features=template_features,
+            match_ratio=getattr(args, 'match_ratio', 0.75),
+            min_feature_matches=getattr(args, 'min_feature_matches', 8),
+            feature_scene_scale=getattr(args, 'feature_scene_scale', 1.0),
+            repeat_click=getattr(args, 'repeat', False),
+            repeat_limit=getattr(args, 'repeat_limit', 0),
+            cycle_count=getattr(args, 'cycle_count', 0),
+            secondary_target=getattr(args, 'secondary_target', None),
             log_callback=None)
     except pytesseract.pytesseract.TesseractNotFoundError:
         _log("Tesseract not found. Install Tesseract OCR or pass its path with --tesseract-cmd.", logger=logger, level='error')
