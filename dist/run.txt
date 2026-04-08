@@ -1,1 +1,0 @@
-.\dist\autoclicker_console.exe --target "Fish Again" --region 201 896 400 120 --start --debug --template template_fish.png --template-threshold 0.65 --template-scales 0.8 0.9 1.0 1.1 1.2 --interval 5 --tesseract-cmd "C:\Users\Ajing\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"

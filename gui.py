@@ -2,7 +2,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-from autoclicker import run_scanner
+from src.autoclicker import run_scanner
 
 
 class App:
